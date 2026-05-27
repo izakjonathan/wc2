@@ -30,13 +30,23 @@ function shouldDeletePath(filePath, deletePaths) {
 }
 
 async function getRecursiveTree(octokit, owner, repo, treeSha) {
-  const tree = await octokit.git.getTree({
-    owner,
-    repo,
-    tree_sha: treeSha,
-    recursive: "true"
-  });
-  return tree.data.tree || [];
+  try {
+    const tree = await octokit.git.getTree({
+      owner,
+      repo,
+      tree_sha: treeSha,
+      recursive: "true"
+    });
+    return tree.data.tree || [];
+  } catch (error) {
+    // GitHub can return 404 for empty trees, inaccessible repos, wrong owner/repo,
+    // wrong branch, or insufficient token access. Empty-tree replacement should
+    // still be allowed, so treat 404 here as an empty existing tree.
+    if (error.status === 404) {
+      return [];
+    }
+    throw error;
+  }
 }
 
 export async function POST(request) {
@@ -52,6 +62,7 @@ export async function POST(request) {
     const branch = String(form.get("branch") || "main").trim();
     const message = String(form.get("message") || "").trim();
     const deleteExisting = String(form.get("deleteExisting") || "false") === "true";
+    const fullRepositoryReplace = String(form.get("fullRepositoryReplace") || "false") === "true";
     const nuclearMode = String(form.get("nuclearMode") || "false") === "true";
     const deletePaths = String(form.get("deletePaths") || "")
       .split(/\r?\n/)
@@ -123,9 +134,9 @@ export async function POST(request) {
           treeItems.push({ path:item.path, mode:"100644", type:"blob", sha:null });
         }
       }
-    } else if (deleteExisting && deletePaths.length) {
+    } else if ((fullRepositoryReplace || deleteExisting) && (fullRepositoryReplace || deletePaths.length)) {
       for (const item of existingTree) {
-        if (item.type === "blob" && shouldDeletePath(item.path, deletePaths)) {
+        if (item.type === "blob" && (fullRepositoryReplace || shouldDeletePath(item.path, deletePaths))) {
           treeItems.push({
             path: item.path,
             mode: "100644",
