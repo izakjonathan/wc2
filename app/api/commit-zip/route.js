@@ -3,8 +3,34 @@ import JSZip from "jszip";
 
 export const runtime = "nodejs";
 
+const PRESERVE_PATHS = [
+  ".github",
+  ".gitignore",
+  "vercel.json",
+  "docs",
+  "README.md"
+];
+
+function isPreservedPath(path) {
+  return PRESERVE_PATHS.some((preserve) => {
+    return path === preserve || path.startsWith(`${preserve}/`);
+  });
+}
+export const maxDuration = 60;
+
+function cleanInput(value) {
+  return String(value || "")
+    .trim()
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/^https?:\/\/github\.com\//i, "")
+    .replace(/^\/+|\/+$/g, "");
+}
+
 function normalizePath(path) {
-  return path.replace(/^\.\//, "").replace(/^\/+/, "");
+  return String(path || "")
+    .replace(/\\/g, "/")
+    .replace(/^\.\//, "")
+    .replace(/^\/+/, "");
 }
 
 function isNoise(path) {
@@ -29,24 +55,52 @@ function shouldDeletePath(filePath, deletePaths) {
   });
 }
 
-async function getRecursiveTree(octokit, owner, repo, treeSha) {
-  try {
-    const tree = await octokit.git.getTree({
-      owner,
-      repo,
-      tree_sha: treeSha,
-      recursive: "true"
-    });
-    return tree.data.tree || [];
-  } catch (error) {
-    // GitHub can return 404 for empty trees, inaccessible repos, wrong owner/repo,
-    // wrong branch, or insufficient token access. Empty-tree replacement should
-    // still be allowed, so treat 404 here as an empty existing tree.
-    if (error.status === 404) {
-      return [];
-    }
-    throw error;
+function uploadPath(path, stripPrefix) {
+  const clean = normalizePath(path);
+  if (stripPrefix && clean.startsWith(stripPrefix + "/")) {
+    return clean.slice(stripPrefix.length + 1);
   }
+  return clean;
+}
+
+function githubError(error, context) {
+  const status = error.status ? `GitHub status ${error.status}` : "GitHub request failed";
+  const message = error.response?.data?.message || error.message || "Unknown error";
+  const documentation = error.response?.data?.documentation_url ? `\nDocs: ${error.response.data.documentation_url}` : "";
+  const hint = error.status === 404
+    ? "Check owner, repository, branch, and token repository access."
+    : error.status === 401
+      ? "Bad credentials. Check GITHUB_TOKEN in Vercel and redeploy."
+      : error.status === 403
+        ? "Token lacks permission or rate limit was reached."
+        : "";
+  return `${context}\n${status}: ${message}${hint ? `\n${hint}` : ""}${documentation}`;
+}
+
+async function getRecursiveTree(octokit, owner, repo, treeSha) {
+  const tree = await octokit.git.getTree({
+    owner,
+    repo,
+    tree_sha: treeSha,
+    recursive: "true"
+  });
+  return tree.data.tree || [];
+}
+
+async function createBlobItem(octokit, owner, repo, path, buffer) {
+  const blob = await octokit.git.createBlob({
+    owner,
+    repo,
+    content: isBinaryPath(path) ? buffer.toString("base64") : buffer.toString("utf8"),
+    encoding: isBinaryPath(path) ? "base64" : "utf-8"
+  });
+
+  return {
+    path,
+    mode: "100644",
+    type: "blob",
+    sha: blob.data.sha
+  };
 }
 
 export async function POST(request) {
@@ -57,13 +111,12 @@ export async function POST(request) {
 
     const form = await request.formData();
 
-    const owner = String(form.get("owner") || "").trim();
-    const repo = String(form.get("repo") || "").trim();
-    const branch = String(form.get("branch") || "main").trim();
+    const owner = cleanInput(form.get("owner")).split("/")[0];
+    const repo = cleanInput(form.get("repo")).split("/").filter(Boolean).at(-1);
+    const branch = cleanInput(form.get("branch") || "main");
     const message = String(form.get("message") || "").trim();
-    const deleteExisting = String(form.get("deleteExisting") || "false") === "true";
-    const fullRepositoryReplace = String(form.get("fullRepositoryReplace") || "false") === "true";
-    const nuclearMode = String(form.get("nuclearMode") || "false") === "true";
+    const replaceMode = String(form.get("replaceMode") || "full");
+    const stripPrefix = normalizePath(form.get("stripPrefix") || "");
     const deletePaths = String(form.get("deletePaths") || "")
       .split(/\r?\n/)
       .map((x) => normalizePath(x.trim()))
@@ -77,22 +130,23 @@ export async function POST(request) {
 
     const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
 
-    const ref = await octokit.git.getRef({
-      owner,
-      repo,
-      ref: `heads/${branch}`
-    });
+    let branchData;
+    try {
+      branchData = await octokit.repos.getBranch({ owner, repo, branch });
+    } catch (error) {
+      return Response.json({ error: githubError(error, "Branch lookup failed before commit.") }, { status: error.status || 500 });
+    }
 
-    const parentCommitSha = ref.data.object.sha;
+    const parentCommitSha = branchData.data.commit.sha;
 
-    const parentCommit = await octokit.git.getCommit({
-      owner,
-      repo,
-      commit_sha: parentCommitSha
-    });
+    let parentCommit;
+    try {
+      parentCommit = await octokit.git.getCommit({ owner, repo, commit_sha: parentCommitSha });
+    } catch (error) {
+      return Response.json({ error: githubError(error, "Parent commit lookup failed.") }, { status: error.status || 500 });
+    }
 
     const baseTreeSha = parentCommit.data.tree.sha;
-    const existingTree = await getRecursiveTree(octokit, owner, repo, baseTreeSha);
 
     const zipBuffer = Buffer.from(await zipFile.arrayBuffer());
     const zip = await JSZip.loadAsync(zipBuffer);
@@ -101,42 +155,59 @@ export async function POST(request) {
     const uploadedPaths = [];
 
     for (const [relativePath, entry] of Object.entries(zip.files)) {
-      const path = normalizePath(relativePath);
+      const rawPath = normalizePath(relativePath);
+      const path = uploadPath(rawPath, stripPrefix);
 
-      if (entry.dir || isNoise(path)) continue;
+      if (!path || entry.dir || isNoise(path)) continue;
 
       const buffer = Buffer.from(await entry.async("uint8array"));
-
-      const blob = await octokit.git.createBlob({
-        owner,
-        repo,
-        content: isBinaryPath(path) ? buffer.toString("base64") : buffer.toString("utf8"),
-        encoding: isBinaryPath(path) ? "base64" : "utf-8"
-      });
-
-      treeItems.push({
-        path,
-        mode: "100644",
-        type: "blob",
-        sha: blob.data.sha
-      });
-
-      uploadedPaths.push(path);
+      try {
+        const item = await createBlobItem(octokit, owner, repo, path, buffer);
+        treeItems.push(item);
+        uploadedPaths.push(path);
+      } catch (error) {
+        return Response.json({ error: githubError(error, `Blob creation failed for ${path}.`) }, { status: error.status || 500 });
+      }
     }
 
     if (!uploadedPaths.length) {
       return Response.json({ error: "ZIP contained no uploadable files." }, { status: 400 });
     }
 
-    if (nuclearMode) {
-      for (const item of existingTree) {
-        if (item.type === "blob") {
-          treeItems.push({ path:item.path, mode:"100644", type:"blob", sha:null });
-        }
+    if (replaceMode === "full" && !uploadedPaths.includes("package.json")) {
+      return Response.json({ error: "Full Repository Replace requires package.json at repository root after wrapper stripping." }, { status: 400 });
+    }
+
+    let newTree;
+
+    if (replaceMode === "full") {
+      // Important: no base_tree. This creates a new root tree containing only the ZIP files.
+      // That is cleaner and safer than adding sha:null deletions for every existing path.
+      try {
+        newTree = await octokit.git.createTree({
+          owner,
+          repo,
+          tree: treeItems
+        });
+      } catch (error) {
+        return Response.json({ error: githubError(error, "Full replacement tree creation failed.") }, { status: error.status || 500 });
       }
-    } else if ((fullRepositoryReplace || deleteExisting) && (fullRepositoryReplace || deletePaths.length)) {
+    } else {
+      let existingTree;
+      try {
+        existingTree = await getRecursiveTree(octokit, owner, repo, baseTreeSha);
+      } catch (error) {
+        return Response.json({ error: githubError(error, "Existing tree lookup failed.") }, { status: error.status || 500 });
+      }
+
+      const uploadedSet = new Set(uploadedPaths);
+
       for (const item of existingTree) {
-        if (item.type === "blob" && (fullRepositoryReplace || shouldDeletePath(item.path, deletePaths))) {
+        if (
+          item.type === "blob" &&
+          shouldDeletePath(item.path, deletePaths) &&
+          !uploadedSet.has(item.path)
+        ) {
           treeItems.push({
             path: item.path,
             mode: "100644",
@@ -145,39 +216,53 @@ export async function POST(request) {
           });
         }
       }
+
+      try {
+        newTree = await octokit.git.createTree({
+          owner,
+          repo,
+          base_tree: baseTreeSha,
+          tree: treeItems
+        });
+      } catch (error) {
+        return Response.json({ error: githubError(error, "Selected replacement tree creation failed.") }, { status: error.status || 500 });
+      }
     }
 
-    const newTree = await octokit.git.createTree({
-      owner,
-      repo,
-      base_tree: baseTreeSha,
-      tree: treeItems
-    });
+    let newCommit;
+    try {
+      newCommit = await octokit.git.createCommit({
+        owner,
+        repo,
+        message,
+        tree: newTree.data.sha,
+        parents: [parentCommitSha]
+      });
+    } catch (error) {
+      return Response.json({ error: githubError(error, "Commit creation failed.") }, { status: error.status || 500 });
+    }
 
-    const newCommit = await octokit.git.createCommit({
-      owner,
-      repo,
-      message,
-      tree: newTree.data.sha,
-      parents: [parentCommitSha]
-    });
-
-    await octokit.git.updateRef({
-      owner,
-      repo,
-      ref: `heads/${branch}`,
-      sha: newCommit.data.sha
-    });
+    try {
+      await octokit.git.updateRef({
+        owner,
+        repo,
+        ref: `heads/${branch}`,
+        sha: newCommit.data.sha
+      });
+    } catch (error) {
+      return Response.json({ error: githubError(error, "Branch update failed.") }, { status: error.status || 500 });
+    }
 
     return Response.json({
       ok: true,
       commitSha: newCommit.data.sha,
       filesUploaded: uploadedPaths.length,
-      deletedPaths: nuclearMode ? ["FULL_REPOSITORY"] : (deleteExisting ? deletePaths : [])
+      mode: replaceMode === "full" ? "FULL_REPOSITORY_REPLACE" : "SELECTED_PATH_REPLACE",
+      stripPrefix
     });
   } catch (error) {
     return Response.json({
-      error: error.message || "Unexpected commit error."
+      error: `Unexpected commit error: ${error.message || error}`
     }, { status: 500 });
   }
 }
