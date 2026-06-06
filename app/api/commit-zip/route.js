@@ -63,6 +63,24 @@ function uploadPath(path, stripPrefix) {
   return clean;
 }
 
+
+function findCaseOnlyDuplicates(paths) {
+  const seen = new Map();
+  const duplicates = [];
+
+  for (const path of paths) {
+    const key = path.toLowerCase();
+    const existing = seen.get(key);
+    if (existing && existing !== path) {
+      duplicates.push([existing, path]);
+    } else if (!existing) {
+      seen.set(key, path);
+    }
+  }
+
+  return duplicates;
+}
+
 function githubError(error, context) {
   const status = error.status ? `GitHub status ${error.status}` : "GitHub request failed";
   const message = error.response?.data?.message || error.message || "Unknown error";
@@ -111,7 +129,7 @@ export async function POST(request) {
 
     const form = await request.formData();
 
-    const owner = cleanInput(form.get("owner")).split("/")[0];
+    const owner = cleanInput(form.get("owner") || "izakjonathan").split("/")[0];
     const repo = cleanInput(form.get("repo")).split("/").filter(Boolean).at(-1);
     const branch = cleanInput(form.get("branch") || "main");
     const message = String(form.get("message") || "").trim();
@@ -172,6 +190,14 @@ export async function POST(request) {
 
     if (!uploadedPaths.length) {
       return Response.json({ error: "ZIP contained no uploadable files." }, { status: 400 });
+    }
+
+    const caseDuplicates = findCaseOnlyDuplicates(uploadedPaths);
+    if (caseDuplicates.length) {
+      const examples = caseDuplicates.slice(0, 5).map(([a, b]) => `${a}  ↔  ${b}`).join("\n");
+      return Response.json({
+        error: `The ZIP contains files or folders that only differ by upper/lowercase. Vercel/Next.js rejects this because it can corrupt builds on case-insensitive filesystems. Rename or remove one of each pair before committing:\n\n${examples}`
+      }, { status: 400 });
     }
 
     if (replaceMode === "full" && !uploadedPaths.includes("package.json")) {
