@@ -3,6 +3,9 @@
 import { useMemo, useState } from "react";
 import JSZip from "jszip";
 
+const DEFAULT_OWNER = "izakjonathan";
+const DEFAULT_BRANCH = "main";
+const DEFAULT_MESSAGE = "Replace project with latest ZIP build";
 const DEFAULT_DELETE = ["app", "components", "data", "public"];
 
 function cleanInput(value) {
@@ -64,23 +67,16 @@ function formatSize(bytes) {
 }
 
 export default function Home() {
-  const [owner, setOwner] = useState("");
   const [repo, setRepo] = useState("");
-  const [branch, setBranch] = useState("main");
-  const [message, setMessage] = useState("Replace project with latest ZIP build");
   const [zipFile, setZipFile] = useState(null);
   const [files, setFiles] = useState([]);
   const [stripPrefix, setStripPrefix] = useState("");
-  const [replaceMode, setReplaceMode] = useState("full");
-  const [confirmReplace, setConfirmReplace] = useState("");
-  const [deletePaths, setDeletePaths] = useState(DEFAULT_DELETE.join("\n"));
   const [status, setStatus] = useState("");
   const [busy, setBusy] = useState(false);
-  const [repoStatus, setRepoStatus] = useState("");
 
-  const normalizedOwner = cleanInput(owner).split("/")[0] || "";
+  const normalizedOwner = DEFAULT_OWNER;
   const normalizedRepo = cleanInput(repo).split("/").filter(Boolean).at(-1) || "";
-  const normalizedBranch = cleanInput(branch);
+  const normalizedBranch = DEFAULT_BRANCH;
 
   const summary = useMemo(() => {
     const total = files.reduce((sum, file) => sum + file.size, 0);
@@ -129,56 +125,16 @@ export default function Home() {
     }
   }
 
-  async function checkRepo() {
-    if (!normalizedOwner || !normalizedRepo || !normalizedBranch) {
-      setRepoStatus("Enter owner, repo and branch first.");
-      return;
-    }
-
-    setRepoStatus("Checking repository...");
-    try {
-      const res = await fetch("/api/check-repo", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          owner: normalizedOwner,
-          repo: normalizedRepo,
-          branch: normalizedBranch
-        })
-      });
-
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Check failed.");
-
-      setRepoStatus(
-        `OK\nRepository: ${data.fullName}\nBranch: ${data.branch}\nLatest commit: ${data.commitSha}\nDefault branch: ${data.defaultBranch}`
-      );
-    } catch (error) {
-      setRepoStatus(`Error:\n${error.message}`);
-    }
-  }
-
   async function commitZip() {
-    if (!normalizedOwner || !normalizedRepo || !normalizedBranch || !message || !zipFile) {
-      setStatus("Missing owner, repo, branch, commit message or ZIP.");
+    if (!normalizedRepo || !zipFile) {
+      setStatus("Add the repository name and choose a ZIP first.");
       return;
     }
 
-    if (replaceMode === "full" && confirmReplace !== "REPLACE") {
-      setStatus("Type REPLACE to enable full repository replacement.");
+    if (!summary.hasPackageJson) {
+      setStatus("The ZIP needs package.json at the root. If your ZIP has one wrapper folder, this app strips it automatically.");
       return;
     }
-
-    if (replaceMode === "full" && !summary.hasPackageJson) {
-      setStatus("Full Repository Replace requires package.json at the ZIP root. If your ZIP has a wrapper folder, this app tries to strip it automatically.");
-      return;
-    }
-
-    const confirmText = replaceMode === "full"
-      ? `WARNING: This will replace ALL files in ${normalizedOwner}/${normalizedRepo}:${normalizedBranch} with the ZIP contents.`
-      : `This will delete selected paths first:\n${deletePaths}\n\nThen upload ${files.length} files to ${normalizedOwner}/${normalizedRepo}:${normalizedBranch}.`;
-
-    if (!window.confirm(confirmText)) return;
 
     setBusy(true);
     setStatus("Uploading ZIP and creating GitHub commit...");
@@ -188,10 +144,10 @@ export default function Home() {
       form.append("owner", normalizedOwner);
       form.append("repo", normalizedRepo);
       form.append("branch", normalizedBranch);
-      form.append("message", message.trim());
-      form.append("replaceMode", replaceMode);
+      form.append("message", DEFAULT_MESSAGE);
+      form.append("replaceMode", "full");
       form.append("stripPrefix", stripPrefix);
-      form.append("deletePaths", deletePaths);
+      form.append("deletePaths", DEFAULT_DELETE.join("\n"));
       form.append("zip", zipFile);
 
       const res = await fetch("/api/commit-zip", {
@@ -203,7 +159,7 @@ export default function Home() {
       if (!res.ok) throw new Error(data.error || "Commit failed.");
 
       setStatus(
-        `SUCCESS\n\nRepository: ${normalizedOwner}/${normalizedRepo}\nBranch: ${normalizedBranch}\nCommit: ${data.commitSha}\nFiles uploaded: ${data.filesUploaded}\nMode: ${data.mode}\nStripped wrapper: ${data.stripPrefix || "none"}\n\nVercel should deploy automatically if connected.`
+        `SUCCESS\n\nRepository: ${normalizedOwner}/${normalizedRepo}\nBranch: ${normalizedBranch}\nCommit: ${data.commitSha}\nFiles uploaded: ${data.filesUploaded}\nMode: ${data.mode}\nProtected paths preserved: ${data.preservedPaths || 0}\nStripped wrapper: ${data.stripPrefix || "none"}\n\nVercel should deploy automatically if connected.`
       );
     } catch (error) {
       setStatus(`ERROR\n\n${error.message}`);
@@ -215,39 +171,27 @@ export default function Home() {
   return (
     <main>
       <div className="kicker">ZIP → GitHub Commit</div>
-      <h1>GitHub ZIP Committer</h1>
+      <h1>Commit ZIP</h1>
       <p>
-        Upload a ZIP build from iPhone/iPad, replace repository files and commit directly to GitHub.
+        Owner is fixed to <b>{DEFAULT_OWNER}</b>. Enter the repo name, choose your ZIP and press commit.
       </p>
 
       <section className="card">
         <h2>1. Repository</h2>
-        <div className="grid">
-          <div>
-            <label>GitHub owner</label>
-            <input value={owner} onChange={(e) => setOwner(e.target.value)} placeholder="izakjonathan" autoCapitalize="none" />
-          </div>
-          <div>
-            <label>Repository</label>
-            <input value={repo} onChange={(e) => setRepo(e.target.value)} placeholder="portfolio2" autoCapitalize="none" />
-          </div>
-          <div>
-            <label>Branch</label>
-            <input value={branch} onChange={(e) => setBranch(e.target.value)} placeholder="main" autoCapitalize="none" />
-          </div>
-          <div>
-            <label>Commit message</label>
-            <input value={message} onChange={(e) => setMessage(e.target.value)} />
-          </div>
-        </div>
-        <div className="actions">
-          <button className="secondary" onClick={checkRepo}>Check repo</button>
-        </div>
-        {repoStatus && <pre className="status">{repoStatus}</pre>}
+        <label>Repository name</label>
+        <input
+          value={repo}
+          onChange={(e) => setRepo(e.target.value)}
+          placeholder="portfolio2"
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck="false"
+        />
+        <small>Commits to {DEFAULT_OWNER}/{normalizedRepo || "repo-name"}:{DEFAULT_BRANCH}</small>
       </section>
 
       <section className="card">
-        <h2>2. Upload ZIP</h2>
+        <h2>2. ZIP</h2>
         <input type="file" accept=".zip,application/zip" onChange={(e) => handleZip(e.target.files?.[0])} />
 
         {stripPrefix && (
@@ -277,43 +221,12 @@ export default function Home() {
       </section>
 
       <section className="card">
-        <h2>3. Replace Mode</h2>
-
-        <div className="mode-grid">
-          <button className={replaceMode === "full" ? "mode active" : "mode"} onClick={() => setReplaceMode("full")} type="button">
-            Full Repository Replace
-            <small>Deletes everything by creating a new root tree from the ZIP.</small>
-          </button>
-          <button className={replaceMode === "selected" ? "mode active" : "mode"} onClick={() => setReplaceMode("selected")} type="button">
-            Selected Folder Replace
-            <small>Deletes listed paths first, then uploads ZIP files.</small>
-          </button>
-        </div>
-
-        {replaceMode === "full" && (
-          <div style={{ marginTop: 14 }}>
-            <label>Type REPLACE to confirm full repository replacement</label>
-            <input value={confirmReplace} onChange={(e) => setConfirmReplace(e.target.value)} placeholder="REPLACE" autoCapitalize="characters" />
-          </div>
-        )}
-
-        {replaceMode === "selected" && (
-          <div style={{ marginTop: 14 }}>
-            <label>Delete these root paths first</label>
-            <textarea value={deletePaths} onChange={(e) => setDeletePaths(e.target.value)} />
-          </div>
-        )}
-
-        <div className="danger-note">
-          Full Replace creates a new tree containing only your ZIP files. It avoids old files being left behind.
-        </div>
-      </section>
-
-      <section className="card">
-        <h2>4. Commit</h2>
-        <p>The app creates Git blobs, a tree, a commit and updates your branch through the GitHub API.</p>
+        <h2>3. Commit</h2>
+        <p>
+          This replaces the project with the ZIP contents on <b>{DEFAULT_BRANCH}</b>, while preserving protected repository files like .github, .gitignore, vercel.json, docs and README.md when they already exist.
+        </p>
         <div className="actions">
-          <button disabled={busy || !zipFile || (replaceMode === "full" && confirmReplace !== "REPLACE")} onClick={commitZip}>
+          <button disabled={busy || !zipFile || !normalizedRepo} onClick={commitZip}>
             {busy ? "Committing..." : "Commit ZIP to GitHub"}
           </button>
           <button className="secondary" onClick={() => setStatus("")}>Clear status</button>

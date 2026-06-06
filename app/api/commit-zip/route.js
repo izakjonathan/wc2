@@ -3,53 +3,104 @@ import JSZip from "jszip";
 
 export const runtime = "nodejs";
 
-const PRESERVE_PATHS = [".github", ".gitignore", "vercel.json", "docs", "README.md"];
+const PRESERVE_PATHS = [
+  ".github",
+  ".gitignore",
+  "vercel.json",
+  "docs",
+  "README.md"
+];
 
 function isPreservedPath(path) {
-  return PRESERVE_PATHS.some((preserve) => path === preserve || path.startsWith(`${preserve}/`));
+  return PRESERVE_PATHS.some((preserve) => {
+    return path === preserve || path.startsWith(`${preserve}/`);
+  });
+}
+export const maxDuration = 60;
+
+function cleanInput(value) {
+  return String(value || "")
+    .trim()
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/^https?:\/\/github\.com\//i, "")
+    .replace(/^\/+|\/+$/g, "");
 }
 
-function normalizeZipPath(path) {
-  if (!path) return null;
-
-  const normalized = path
+function normalizePath(path) {
+  return String(path || "")
     .replace(/\\/g, "/")
-    .replace(/^\/+/, "")
-    .replace(/^\.\/+/, "")
-    .replace(/\/+/g, "/")
-    .trim();
-
-  if (!normalized) return null;
-  if (normalized.startsWith("__MACOSX/")) return null;
-  if (normalized.endsWith(".DS_Store")) return null;
-  if (normalized.includes("/.DS_Store")) return null;
-  if (normalized === "." || normalized === "/") return null;
-
-  return normalized;
+    .replace(/^\.\//, "")
+    .replace(/^\/+/, "");
 }
 
-function stripSingleRootFolder(paths) {
-  const valid = paths.filter(Boolean);
-  const roots = [...new Set(valid.map((p) => p.split("/")[0]))];
-
-  if (roots.length !== 1) return new Map(valid.map((p) => [p, p]));
-
-  const root = roots[0];
-
-  if (["app", "components", "data", "public", "src"].includes(root)) {
-    return new Map(valid.map((p) => [p, p]));
-  }
-
-  return new Map(
-    valid.map((p) => {
-      const stripped = p.startsWith(`${root}/`) ? p.slice(root.length + 1) : p;
-      return [p, stripped || null];
-    })
+function isNoise(path) {
+  const p = path.toLowerCase();
+  return (
+    p.includes("__macosx/") ||
+    p.endsWith(".ds_store") ||
+    p.includes("node_modules/") ||
+    p.includes(".git/") ||
+    p.includes(".next/")
   );
 }
 
 function isBinaryPath(path) {
   return /\.(png|jpg|jpeg|gif|webp|ico|pdf|zip|woff|woff2|ttf|otf|mp4|mov|mp3|wav|avif|heic)$/i.test(path);
+}
+
+function shouldDeletePath(filePath, deletePaths) {
+  return deletePaths.some((path) => {
+    const clean = normalizePath(path).replace(/\/$/, "");
+    return filePath === clean || filePath.startsWith(`${clean}/`);
+  });
+}
+
+function uploadPath(path, stripPrefix) {
+  const clean = normalizePath(path);
+  if (stripPrefix && clean.startsWith(stripPrefix + "/")) {
+    return clean.slice(stripPrefix.length + 1);
+  }
+  return clean;
+}
+
+function githubError(error, context) {
+  const status = error.status ? `GitHub status ${error.status}` : "GitHub request failed";
+  const message = error.response?.data?.message || error.message || "Unknown error";
+  const documentation = error.response?.data?.documentation_url ? `\nDocs: ${error.response.data.documentation_url}` : "";
+  const hint = error.status === 404
+    ? "Check owner, repository, branch, and token repository access."
+    : error.status === 401
+      ? "Bad credentials. Check GITHUB_TOKEN in Vercel and redeploy."
+      : error.status === 403
+        ? "Token lacks permission or rate limit was reached."
+        : "";
+  return `${context}\n${status}: ${message}${hint ? `\n${hint}` : ""}${documentation}`;
+}
+
+async function getRecursiveTree(octokit, owner, repo, treeSha) {
+  const tree = await octokit.git.getTree({
+    owner,
+    repo,
+    tree_sha: treeSha,
+    recursive: "true"
+  });
+  return tree.data.tree || [];
+}
+
+async function createBlobItem(octokit, owner, repo, path, buffer) {
+  const blob = await octokit.git.createBlob({
+    owner,
+    repo,
+    content: isBinaryPath(path) ? buffer.toString("base64") : buffer.toString("utf8"),
+    encoding: isBinaryPath(path) ? "base64" : "utf-8"
+  });
+
+  return {
+    path,
+    mode: "100644",
+    type: "blob",
+    sha: blob.data.sha
+  };
 }
 
 export async function POST(request) {
@@ -60,11 +111,17 @@ export async function POST(request) {
 
     const form = await request.formData();
 
-    const owner = String(form.get("owner") || "").trim();
-    const repo = String(form.get("repo") || "").trim();
-    const branch = String(form.get("branch") || "main").trim();
+    const owner = cleanInput(form.get("owner")).split("/")[0];
+    const repo = cleanInput(form.get("repo")).split("/").filter(Boolean).at(-1);
+    const branch = cleanInput(form.get("branch") || "main");
     const message = String(form.get("message") || "").trim();
-    const fullRepositoryReplace = String(form.get("fullRepositoryReplace") || "false") === "true";
+    const replaceMode = String(form.get("replaceMode") || "full");
+    const stripPrefix = normalizePath(form.get("stripPrefix") || "");
+    const deletePaths = String(form.get("deletePaths") || "")
+      .split(/\r?\n/)
+      .map((x) => normalizePath(x.trim()))
+      .filter(Boolean);
+
     const zipFile = form.get("zip");
 
     if (!owner || !repo || !branch || !message || !zipFile) {
@@ -73,106 +130,160 @@ export async function POST(request) {
 
     const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
 
-    const branchData = await octokit.repos.getBranch({ owner, repo, branch });
+    let branchData;
+    try {
+      branchData = await octokit.repos.getBranch({ owner, repo, branch });
+    } catch (error) {
+      return Response.json({ error: githubError(error, "Branch lookup failed before commit.") }, { status: error.status || 500 });
+    }
+
     const parentCommitSha = branchData.data.commit.sha;
 
-    const parentCommit = await octokit.git.getCommit({
-      owner,
-      repo,
-      commit_sha: parentCommitSha,
-    });
+    let parentCommit;
+    try {
+      parentCommit = await octokit.git.getCommit({ owner, repo, commit_sha: parentCommitSha });
+    } catch (error) {
+      return Response.json({ error: githubError(error, "Parent commit lookup failed.") }, { status: error.status || 500 });
+    }
 
     const baseTreeSha = parentCommit.data.tree.sha;
 
-    const zip = await JSZip.loadAsync(await zipFile.arrayBuffer());
-
-    const originalPaths = [];
-    for (const [relativePath, entry] of Object.entries(zip.files)) {
-      const normalized = normalizeZipPath(relativePath);
-      if (!entry.dir && normalized) originalPaths.push(normalized);
-    }
-
-    const stripMap = stripSingleRootFolder(originalPaths);
-
-    const finalPaths = [...stripMap.values()].filter(Boolean);
-
-    if (fullRepositoryReplace && !finalPaths.includes("package.json")) {
-      return Response.json(
-        { error: "Full Repository Replace requires package.json at the ZIP root." },
-        { status: 400 }
-      );
-    }
+    const zipBuffer = Buffer.from(await zipFile.arrayBuffer());
+    const zip = await JSZip.loadAsync(zipBuffer);
 
     const treeItems = [];
     const uploadedPaths = [];
 
     for (const [relativePath, entry] of Object.entries(zip.files)) {
-      const normalizedOriginal = normalizeZipPath(relativePath);
-      if (entry.dir || !normalizedOriginal) continue;
+      const rawPath = normalizePath(relativePath);
+      const path = uploadPath(rawPath, stripPrefix);
 
-      const finalPath = stripMap.get(normalizedOriginal);
-      if (!finalPath) continue;
+      if (!path || entry.dir || isNoise(path)) continue;
 
       const buffer = Buffer.from(await entry.async("uint8array"));
-
-      const blob = await octokit.git.createBlob({
-        owner,
-        repo,
-        content: isBinaryPath(finalPath) ? buffer.toString("base64") : buffer.toString("utf8"),
-        encoding: isBinaryPath(finalPath) ? "base64" : "utf-8",
-      });
-
-      treeItems.push({
-        path: finalPath,
-        mode: "100644",
-        type: "blob",
-        sha: blob.data.sha,
-      });
-
-      uploadedPaths.push(finalPath);
+      try {
+        const item = await createBlobItem(octokit, owner, repo, path, buffer);
+        treeItems.push(item);
+        uploadedPaths.push(path);
+      } catch (error) {
+        return Response.json({ error: githubError(error, `Blob creation failed for ${path}.`) }, { status: error.status || 500 });
+      }
     }
 
     if (!uploadedPaths.length) {
       return Response.json({ error: "ZIP contained no uploadable files." }, { status: 400 });
     }
 
-    const newTree = await octokit.git.createTree({
-      owner,
-      repo,
-      base_tree: fullRepositoryReplace ? undefined : baseTreeSha,
-      tree: treeItems,
-    });
+    if (replaceMode === "full" && !uploadedPaths.includes("package.json")) {
+      return Response.json({ error: "Full Repository Replace requires package.json at repository root after wrapper stripping." }, { status: 400 });
+    }
 
-    const newCommit = await octokit.git.createCommit({
-      owner,
-      repo,
-      message,
-      tree: newTree.data.sha,
-      parents: [parentCommitSha],
-    });
+    let newTree;
+    let preservedPaths = 0;
 
-    await octokit.git.updateRef({
-      owner,
-      repo,
-      ref: `heads/${branch}`,
-      sha: newCommit.data.sha,
-    });
+    if (replaceMode === "full") {
+      // Important: no base_tree. This creates a clean root tree.
+      // Protected repository files are copied from the existing tree unless the ZIP replaces them.
+      try {
+        const existingTree = await getRecursiveTree(octokit, owner, repo, baseTreeSha);
+        const uploadedSet = new Set(uploadedPaths);
+
+        for (const item of existingTree) {
+          if (
+            item.type === "blob" &&
+            isPreservedPath(item.path) &&
+            !uploadedSet.has(item.path)
+          ) {
+            treeItems.push({
+              path: item.path,
+              mode: item.mode || "100644",
+              type: "blob",
+              sha: item.sha
+            });
+            preservedPaths += 1;
+          }
+        }
+
+        newTree = await octokit.git.createTree({
+          owner,
+          repo,
+          tree: treeItems
+        });
+      } catch (error) {
+        return Response.json({ error: githubError(error, "Full replacement tree creation failed.") }, { status: error.status || 500 });
+      }
+    } else {
+      let existingTree;
+      try {
+        existingTree = await getRecursiveTree(octokit, owner, repo, baseTreeSha);
+      } catch (error) {
+        return Response.json({ error: githubError(error, "Existing tree lookup failed.") }, { status: error.status || 500 });
+      }
+
+      const uploadedSet = new Set(uploadedPaths);
+
+      for (const item of existingTree) {
+        if (
+          item.type === "blob" &&
+          shouldDeletePath(item.path, deletePaths) &&
+          !uploadedSet.has(item.path)
+        ) {
+          treeItems.push({
+            path: item.path,
+            mode: "100644",
+            type: "blob",
+            sha: null
+          });
+        }
+      }
+
+      try {
+        newTree = await octokit.git.createTree({
+          owner,
+          repo,
+          base_tree: baseTreeSha,
+          tree: treeItems
+        });
+      } catch (error) {
+        return Response.json({ error: githubError(error, "Selected replacement tree creation failed.") }, { status: error.status || 500 });
+      }
+    }
+
+    let newCommit;
+    try {
+      newCommit = await octokit.git.createCommit({
+        owner,
+        repo,
+        message,
+        tree: newTree.data.sha,
+        parents: [parentCommitSha]
+      });
+    } catch (error) {
+      return Response.json({ error: githubError(error, "Commit creation failed.") }, { status: error.status || 500 });
+    }
+
+    try {
+      await octokit.git.updateRef({
+        owner,
+        repo,
+        ref: `heads/${branch}`,
+        sha: newCommit.data.sha
+      });
+    } catch (error) {
+      return Response.json({ error: githubError(error, "Branch update failed.") }, { status: error.status || 500 });
+    }
 
     return Response.json({
       ok: true,
       commitSha: newCommit.data.sha,
       filesUploaded: uploadedPaths.length,
-      deletedPaths: fullRepositoryReplace ? ["FULL_REPOSITORY_EXCEPT_PROTECTED_PATHS"] : [],
-      preservedPaths: PRESERVE_PATHS,
+      mode: replaceMode === "full" ? "FULL_REPOSITORY_REPLACE" : "SELECTED_PATH_REPLACE",
+      preservedPaths,
+      stripPrefix
     });
   } catch (error) {
-    return Response.json(
-      {
-        error: error.message || "Unexpected commit error.",
-        status: error.status || null,
-        details: error.response?.data || null,
-      },
-      { status: 500 }
-    );
+    return Response.json({
+      error: `Unexpected commit error: ${error.message || error}`
+    }, { status: 500 });
   }
 }
